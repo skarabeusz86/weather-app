@@ -1,0 +1,278 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Aplikacja pogodowa – meteoblue</title>
+
+  <!-- Leaflet (mapa) -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+  <!-- Chart.js (wykres) -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      background: #0f172a;
+      color: #e5e7eb;
+      display: flex;
+      justify-content: center;
+      padding: 2rem;
+    }
+
+    .app {
+      width: 100%;
+      max-width: 420px;
+      background: #020617;
+      border-radius: 16px;
+      padding: 1.5rem;
+    }
+
+    h1 { text-align: center; margin-bottom: 0.5rem; }
+
+    button {
+      width: 100%;
+      padding: 0.6rem;
+      margin-bottom: 0.6rem;
+      border-radius: 8px;
+      border: none;
+      cursor: pointer;
+      font-size: 1rem;
+    }
+
+    .search { position: relative; }
+
+    input {
+      width: 100%;
+      padding: 0.7rem;
+      border-radius: 8px;
+      border: none;
+      outline: none;
+      margin-bottom: 0.3rem;
+    }
+
+    .suggestions {
+      position: absolute;
+      top: 100%;
+      left: 0;
+      right: 0;
+      background: #fff;
+      color: #000;
+      border-radius: 8px;
+      overflow: hidden;
+      display: none;
+      z-index: 1000;
+    }
+
+    .suggestions div {
+      padding: 0.5rem;
+      cursor: pointer;
+    }
+
+    .suggestions div:hover { background: #e5e7eb; }
+
+    #map {
+      height: 200px;
+      margin-top: 0.8rem;
+      border-radius: 12px;
+    }
+
+    .weather { text-align: center; margin-top: 0.8rem; }
+    .temp { font-size: 2.4rem; font-weight: bold; }
+
+    canvas { margin-top: 1rem; }
+  </style>
+</head>
+<body>
+
+<div class="app">
+  <h1>🌦 Pogoda</h1>
+
+  <button id="gpsBtn">📍 Moja lokalizacja</button>
+
+  <div class="search">
+    <input id="city" placeholder="Wpisz miasto (np. Tuchola)" />
+    <div id="suggestions" class="suggestions"></div>
+  </div>
+
+  <div id="map"></div>
+
+  <div class="weather" id="weather"></div>
+
+  <canvas id="tempChart"></canvas>
+</div>
+
+<script>
+  /* =====================
+     KONFIGURACJA
+  ====================== */
+  const METEOBLUE_KEY = "DZVYawuEXtWIP0Uj";
+
+  /* =====================
+     ELEMENTY DOM
+  ====================== */
+  const input = document.getElementById('city');
+  const suggestions = document.getElementById('suggestions');
+  const weatherBox = document.getElementById('weather');
+  const gpsBtn = document.getElementById('gpsBtn');
+  const chartCanvas = document.getElementById('tempChart');
+
+  /* =====================
+     MAPA
+  ====================== */
+  let map = L.map('map').setView([52.0, 19.0], 6);
+  let marker = null;
+
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    attribution: '© OpenStreetMap'
+  }).addTo(map);
+
+  /* =====================
+     WYKRES
+  ====================== */
+  let chart = null;
+
+  /* =====================
+     AUTOCOMPLETE MIAST
+  ====================== */
+  input.addEventListener('input', async () => {
+    const q = input.value.trim();
+    if (q.length < 2) {
+      suggestions.style.display = 'none';
+      return;
+    }
+
+    const res = await fetch(`https://nominatim.openstreetmap.org/search?format=json&q=${q}&countrycodes=pl&limit=5`);
+    const data = await res.json();
+
+    suggestions.innerHTML = '';
+
+    data.forEach(place => {
+      const div = document.createElement('div');
+      div.textContent = place.display_name;
+      div.onclick = () => selectCity(place);
+      suggestions.appendChild(div);
+    });
+
+    suggestions.style.display = 'block';
+  });
+
+  /* =====================
+     WYBÓR MIASTA
+  ====================== */
+  function selectCity(place) {
+    suggestions.style.display = 'none';
+    input.value = place.display_name;
+
+    const lat = Number(place.lat);
+    const lon = Number(place.lon);
+
+    loadWeatherByCoords(lat, lon, place.display_name);
+  }
+
+  /* =====================
+     GPS – MOJA LOKALIZACJA
+  ====================== */
+gpsBtn.onclick = async () => {
+  if (!navigator.geolocation) {
+    alert('Twoja przeglądarka nie obsługuje GPS');
+    return;
+  }
+
+  gpsBtn.textContent = '📍 Pobieranie lokalizacji...';
+
+  navigator.geolocation.getCurrentPosition(
+    async (pos) => {
+      const lat = pos.coords.latitude;
+      const lon = pos.coords.longitude;
+      const accuracy = pos.coords.accuracy; // ← TU JEST DEFINICJA
+
+      console.log(
+        'LAT:', lat,
+        'LON:', lon,
+        'ACCURACY:', Math.round(accuracy), 'm'
+      );
+
+      gpsBtn.textContent = '📍 Moja lokalizacja';
+
+      await loadWeatherByCoords(
+        lat,
+        lon,
+        `Twoja lokalizacja (±${Math.round(accuracy)} m)`
+      );
+    },
+    () => {
+      gpsBtn.textContent = '📍 Moja lokalizacja';
+      alert('Nie udało się pobrać lokalizacji');
+    },
+    { enableHighAccuracy: true, timeout: 10000 }
+  );
+};
+
+
+  /* =====================
+     GŁÓWNA LOGIKA POGODY
+  ====================== */
+  async function loadWeatherByCoords(lat, lon, label) {
+    // 🔎 Reverse geocoding – prawdziwa nazwa miejscowości z GPS
+    try {
+            // 🔎 Reverse geocoding – precyzyjny (wieś / osada, a nie duże miasto)
+      const geoRes = await fetch(`https://nominatim.openstreetmap.org/reverse?format=json&lat=${lat}&lon=${lon}&zoom=18&addressdetails=1&accept-language=pl`);(`https://nominatim.openstreetmap.org/reverse?format=json&lat=${lat}&lon=${lon}&zoom=10&addressdetails=1`);
+      const geo = await geoRes.json();
+      if (geo && geo.address) {
+                label = geo.address.hamlet || geo.address.village || geo.address.suburb || geo.address.town || geo.address.city || label;
+      }
+    } catch (e) {
+      // jeśli reverse geocoding zawiedzie – zostaje label
+    }
+
+    // MAPA(lat, lon, label) {
+    // MAPA
+    map.setView([lat, lon], 11);
+    if (!marker) marker = L.marker([lat, lon]).addTo(map);
+    else marker.setLatLng([lat, lon]);
+
+    // AKTUALNA POGODA
+    const currentRes = await fetch(`https://my.meteoblue.com/packages/current?lat=${lat}&lon=${lon}&apikey=${METEOBLUE_KEY}&units=metric`);
+    const current = await currentRes.json();
+
+    weatherBox.innerHTML = `
+      <div>${label}</div>
+      <div class="temp">${Math.round(current.data_current.temperature)}°C</div>
+      <div>${current.data_current.condition}</div>
+    `;
+
+    // PROGNOZA 7-DNIOWA
+    const forecastRes = await fetch(`https://my.meteoblue.com/packages/basic-day?lat=${lat}&lon=${lon}&apikey=${METEOBLUE_KEY}&units=metric`);
+    const forecast = await forecastRes.json();
+
+    const labels = [];
+    const maxTemps = [];
+    const minTemps = [];
+
+    for (let i = 0; i < 7; i++) {
+      labels.push(`Dzień ${i + 1}`);
+      maxTemps.push(Math.round(forecast.data_day.temperature_max[i]));
+      minTemps.push(Math.round(forecast.data_day.temperature_min[i]));
+    }
+
+    if (chart) chart.destroy();
+
+    chart = new Chart(chartCanvas, {
+      type: 'line',
+      data: {
+        labels,
+        datasets: [
+          { label: 'Temp. max (°C)', data: maxTemps, tension: 0.4 },
+          { label: 'Temp. min (°C)', data: minTemps, tension: 0.4 }
+        ]
+      },
+      options: { responsive: true }
+    });
+  }
+</script>
+
+</body>
+</html>
